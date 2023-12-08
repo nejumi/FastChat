@@ -8,8 +8,8 @@ If you have any changes in mind, please contribute back so the community can ben
 import dataclasses
 from enum import auto, IntEnum
 from typing import List, Any, Dict, Union, Tuple
+from omegaconf import OmegaConf
 
-import wandb
 
 class SeparatorStyle(IntEnum):
     """Separator styles."""
@@ -1200,17 +1200,18 @@ register_conv_template(
     )
 )
 
+cfg_mtbench = OmegaConf.load("configs/config.yaml")
 # conv template for Custom
 # source: hogehoge
 register_conv_template(
     Conversation(
-        name=wandb.config.conv_name,
-        system_message=wandb.config.conv_system_message,
-        roles=eval(wandb.config.conv_roles),
+        name=cfg_mtbench.mtbench.conv_name,
+        system_message=cfg_mtbench.mtbench.conv_system_message,
+        roles=eval(cfg_mtbench.mtbench.conv_roles),
         sep_style=SeparatorStyle.CUSTOM,
-        sep=wandb.config.conv_sep,
-        stop_token_ids=eval(wandb.config.conv_stop_token_ids),
-        stop_str=wandb.config.conv_stop_str,
+        sep=cfg_mtbench.mtbench.conv_sep,
+        stop_token_ids=eval(cfg_mtbench.mtbench.conv_stop_token_ids),
+        stop_str=cfg_mtbench.mtbench.conv_stop_str,
     )
 )
 

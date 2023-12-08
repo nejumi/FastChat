@@ -6,6 +6,7 @@ import re
 import sys
 from typing import Dict, List, Optional
 import warnings
+from omegaconf import OmegaConf
 
 if sys.version_info >= (3, 9):
     from functools import cache
@@ -1833,9 +1834,9 @@ class CustomAdapter(BaseModelAdapter):  # ←追加
     Custom Model adapter
     """
     model_variation = None
-
     def match(self, model_path: str):
-        return wandb.config.custom_conv_template
+        cfg_mtbench = OmegaConf.load("configs/config.yaml")
+        return cfg_mtbench.mtbench.custom_conv_template
 
     def get_default_conv_template(self, model_path:str):
         return get_conv_template(wandb.config.conv_name)
