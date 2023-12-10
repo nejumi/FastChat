@@ -1839,7 +1839,8 @@ class CustomAdapter(BaseModelAdapter):  # ←追加
         return cfg_mtbench.mtbench.custom_conv_template
 
     def get_default_conv_template(self, model_path:str):
-        return get_conv_template(wandb.config.conv_name)
+        cfg_mtbench = OmegaConf.load("configs/config.yaml")
+        return get_conv_template(cfg_mtbench.mtbench.conv_name)
 
 
 # Note: the registration order matters.

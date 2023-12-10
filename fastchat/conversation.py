@@ -230,9 +230,9 @@ class Conversation:
             ret = self.system_message + self.sep
             for role, message in self.messages:
                 if message:
-                    ret += role + wandb.config.conv_role_message_separator + message + self.sep
+                    ret += role + cfg_mtbench.mtbench.conv_role_message_separator + message + self.sep
                 else:
-                    ret += role + wandb.config.conv_role_only_separator
+                    ret += role + cfg_mtbench.mtbench.conv_role_only_separator
             return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
