@@ -13,8 +13,14 @@ from typing import Optional
 
 import openai
 import anthropic
+import cohere
+import google.generativeai as genai
 
-from fastchat.model.model_adapter import get_conversation_template, ANTHROPIC_MODEL_LIST
+from fastchat.model.model_adapter import (
+    get_conversation_template,
+    ANTHROPIC_MODEL_LIST,
+    OPENAI_MODEL_LIST,
+)
 
 # API setting constants
 API_MAX_RETRY = 16
@@ -32,6 +38,7 @@ two_score_pattern_backup = re.compile("\[(\d+\.?\d*),\s?(\d+\.?\d*)\]")
 one_score_pattern = re.compile("\[\[(\d+\.?\d*)\]\]")
 one_score_pattern_backup = re.compile("\[(\d+\.?\d*)\]")
 
+# TODO: (meng) thinking about changing setting for japanese llm usage
 # Sampling temperature configs for
 temperature_config = {
     "writing": 0.7,
@@ -87,7 +94,9 @@ def load_questions(question_file: str, begin: Optional[int], end: Optional[int])
     with open(question_file, "r") as ques_file:
         for line in ques_file:
             if line:
-                questions.append(json.loads(line))
+                q = json.loads(line)
+                q['question_id'] = int(q['question_id'])
+                questions.append(q)
     questions = questions[begin:end]
     return questions
 
@@ -108,7 +117,7 @@ def load_model_answers(answer_dir: str):
         with open(filename) as fin:
             for line in fin:
                 line = json.loads(line)
-                answer[line["question_id"]] = line
+                answer[int(line["question_id"])] = line
         model_answers[model_name] = answer
 
     return model_answers
@@ -159,16 +168,16 @@ def run_judge_single(question, answer, judge, ref_answer, multi_turn=False):
     conv.append_message(conv.roles[0], user_prompt)
     conv.append_message(conv.roles[1], None)
 
-    if model in ["gpt-3.5-turbo", "gpt-4"]:
-        judgment = chat_compeletion_openai(model, conv, temperature=0, max_tokens=2048)
+    if model in OPENAI_MODEL_LIST:
+        judgment = chat_completion_azure_fallback(model, conv, temperature=0, max_tokens=2048)
     elif model in ANTHROPIC_MODEL_LIST:
-        judgment = chat_compeletion_anthropic(
+        judgment = chat_completion_anthropic(
             model, conv, temperature=0, max_tokens=1024
         )
     else:
         raise ValueError(f"Invalid judge model name: {model}")
 
-    if judge.prompt_template["output_format"] == "[[rating]]":
+    if judge.prompt_template["output_format"] in ["[[rating]]", "[[評価]]", "[[평가]]"]:
         match = re.search(one_score_pattern, judgment)
         if not match:
             match = re.search(one_score_pattern_backup, judgment)
@@ -185,7 +194,7 @@ def run_judge_single(question, answer, judge, ref_answer, multi_turn=False):
     return rating, user_prompt, judgment
 
 
-def play_a_match_single(match: MatchPair, output_file: str):
+def play_a_match_single(match: MatchSingle, output_file: str):
     question, model, answer, judge, ref_answer, multi_turn = (
         match.question,
         match.model,
@@ -221,9 +230,13 @@ def play_a_match_single(match: MatchPair, output_file: str):
         raise ValueError(f"invalid judge type: {judge['type']}")
 
     if output_file:
+        output_file = os.path.join(
+            output_file.replace(".jsonl", ""),
+            f"{model}__{turn}turn.jsonl"
+        )
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
         with open(output_file, "a") as fout:
-            fout.write(json.dumps(result) + "\n")
+            fout.write(json.dumps(result, ensure_ascii=False) + "\n")
 
     return result
 
@@ -262,14 +275,14 @@ def run_judge_pair(question, answer_a, answer_b, judge, ref_answer, multi_turn=F
     conv.append_message(conv.roles[0], user_prompt)
     conv.append_message(conv.roles[1], None)
 
-    if model in ["gpt-3.5-turbo", "gpt-4"]:
+    if model in OPENAI_MODEL_LIST:
         conv.set_system_message(system_prompt)
-        judgment = chat_compeletion_openai(model, conv, temperature=0, max_tokens=2048)
+        judgment = chat_completion_openai(model, conv, temperature=0, max_tokens=2048)
     elif model in ANTHROPIC_MODEL_LIST:
         if system_prompt != "You are a helpful assistant.":
             user_prompt = "[Instruction]\n" + system_prompt + "\n\n" + user_prompt
             conv.messages[0][1] = user_prompt
-        judgment = chat_compeletion_anthropic(
+        judgment = chat_completion_anthropic(
             model, conv, temperature=0, max_tokens=1024
         )
     else:
@@ -393,38 +406,100 @@ def play_a_match_pair(match: MatchPair, output_file: str):
         raise ValueError(f"invalid judge type: {judge['type']}")
 
     if output_file:
+        output_file = os.path.join(
+            output_file.replace(".jsonl", ""),
+            f"{model_1}__{model_2}__{turn}turn.jsonl"
+        )
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
         with open(output_file, "a") as fout:
-            fout.write(json.dumps(result) + "\n")
+            fout.write(json.dumps(result, ensure_ascii=False) + "\n")
 
     return result
+    
+def setup_openai_api(model: str, use_azure=False):
+    from functools import partial
 
+    if model == "gpt-3.5-turbo":
+        deployment_id = "misc-35"
+    elif model == "gpt-4":
+        deployment_id = "misc-4"
+    else:
+        raise NotImplementedError(f"{model=}")
 
-def chat_compeletion_openai(model, conv, temperature, max_tokens, api_dict=None):
-    if api_dict is not None:
-        openai.api_base = api_dict["api_base"]
-        openai.api_key = api_dict["api_key"]
+    if use_azure:
+        openai.api_type = "azure"
+        openai.api_key = os.environ['OPENAI_AZURE_API_KEY']
+        openai.api_base = os.environ['OPENAI_AZURE_API_BASE']
+        openai.api_version = "2023-05-15"  # subject to change
+        return partial(openai.ChatCompletion.create, deployment_id=deployment_id)
+    else:
+        openai.api_key = os.environ['OPENAI_API_KEY']
+        return openai.chat.completions.create
+
+def chat_completion_azure_fallback(model, conv, temperature, max_tokens):
+    """Use the Azure OpenAI API if env vars are set, otherwise use OpenAI directly."""
+    if "AZURE_OPENAI_ENDPOINT" in os.environ:
+        return chat_completion_openai_azure(model, conv, temperature, max_tokens)
+    else:
+        return chat_completion_openai(model, conv, temperature, max_tokens)
+
+import openai
+import time
+
+import openai
+import time
+
+def chat_completion_openai(model, conv, temperature, max_tokens):
+    #openai_chat_completion_func = setup_openai_api(model)
     output = API_ERROR_OUTPUT
+    # TODO: allow additional params for toggling between azure api
     for _ in range(API_MAX_RETRY):
         try:
             messages = conv.to_openai_api_messages()
-            response = openai.ChatCompletion.create(
+            response = openai.chat.completions.create(
                 model=model,
                 messages=messages,
                 n=1,
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
-            output = response["choices"][0]["message"]["content"]
+            output = response.choices[0].message.content
             break
-        except openai.error.OpenAIError as e:
+        except openai.OpenAIError as e:
             print(type(e), e)
             time.sleep(API_RETRY_SLEEP)
 
     return output
 
+def chat_completion_vllm(model, conv, temperature, max_tokens):
+    from openai import OpenAI
 
-def chat_compeletion_openai_azure(model, conv, temperature, max_tokens, api_dict=None):
+    # Modify OpenAI's API key and API base to use vLLM's API server.
+    openai_api_key = "EMPTY"
+    openai_api_base = "http://0.0.0.0:8000/v1"
+    client = OpenAI(
+        api_key=openai_api_key,
+        base_url=openai_api_base,
+    )
+    output = API_ERROR_OUTPUT
+    for _ in range(API_MAX_RETRY):
+        try:
+            messages = conv.to_openai_api_messages()
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            output = response.choices[0].message.content
+            break
+        except Exception as e:  # 修正: openai.error.OpenAIError から Exception へ
+            print(type(e), e)
+            time.sleep(API_RETRY_SLEEP)
+
+    return output
+
+def chat_completion_openai_azure(model, conv, temperature, max_tokens, api_dict=None):
     openai.api_type = "azure"
     openai.api_version = "2023-07-01-preview"
     if api_dict is not None:
@@ -453,30 +528,64 @@ def chat_compeletion_openai_azure(model, conv, temperature, max_tokens, api_dict
         except openai.error.OpenAIError as e:
             print(type(e), e)
             time.sleep(API_RETRY_SLEEP)
-        except openai.error.InvalidRequestError as e:
-            print(type(e), e)
-            break
-        except KeyError:
-            print(response)
-            break
-
     return output
 
 
-def chat_compeletion_anthropic(model, conv, temperature, max_tokens):
+def chat_completion_anthropic(model, conv, temperature, max_tokens, api_dict=None):
+    if api_dict is not None and "api_key" in api_dict:
+        api_key = api_dict["api_key"]
+    else:
+        api_key = os.environ["ANTHROPIC_API_KEY"]
+
+    output = API_ERROR_OUTPUT
+    for _ in range(API_MAX_RETRY):
+        if model == "claude-3-opus-20240229":
+            llm = ChatAnthropic(model_name=model)
+            max_retries = 3
+            retry_count = 0
+            prompt = conv.get_prompt()
+            print(prompt)
+            while retry_count < max_retries:
+                try:
+                    output = llm.invoke(prompt).content
+                    # print(output)
+                    time.sleep(60)
+                    break 
+                except Exception as e:
+                    print(f"Error happened!!! : {e}")
+                    retry_count += 1
+                    time.sleep(1)
+        else:
+            try:
+                c = anthropic.Anthropic(api_key=api_key)
+                prompt = conv.get_prompt()
+                response = c.completions.create(
+                    model=model,
+                    prompt=prompt,
+                    stop_sequences=[anthropic.HUMAN_PROMPT],
+                    max_tokens_to_sample=max_tokens,
+                    temperature=temperature,
+                )
+                output = response.completion
+                break
+            except anthropic.APIError as e:
+                print(type(e), e)
+                time.sleep(API_RETRY_SLEEP)
+    return output.strip()
+
+def chat_completion_cohere(model, conv, temperature, max_tokens):
     output = API_ERROR_OUTPUT
     for _ in range(API_MAX_RETRY):
         try:
-            c = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+            co = cohere.Client(api_key=os.environ["COHERE_API_KEY"])
             prompt = conv.get_prompt()
-            response = c.completions.create(
-                model=model,
-                prompt=prompt,
-                stop_sequences=[anthropic.HUMAN_PROMPT],
-                max_tokens_to_sample=max_tokens,
-                temperature=temperature,
+            response = co.chat(
+                prompt, 
+                model=model, 
+                max_tokens=max_tokens,
+                temperature=temperature
             )
-            output = response.completion
+            output = response.text
             break
         except anthropic.APIError as e:
             print(type(e), e)
@@ -484,7 +593,7 @@ def chat_compeletion_anthropic(model, conv, temperature, max_tokens):
     return output.strip()
 
 
-def chat_compeletion_palm(chat_state, model, conv, temperature, max_tokens):
+def chat_completion_palm(chat_state, model, conv, temperature, max_tokens):
     from fastchat.serve.api_provider import init_palm_chat
 
     assert model == "palm-2-chat-bison-001"
@@ -503,6 +612,113 @@ def chat_compeletion_palm(chat_state, model, conv, temperature, max_tokens):
         try:
             response = chat_state.send_message(conv.messages[-2][1], **parameters)
             output = response.text
+            break
+        except Exception as e:
+            print(type(e), e)
+            time.sleep(API_RETRY_SLEEP)
+    return chat_state, output
+
+
+def chat_completion_gemini(chat_state, model, conv, temperature, max_tokens):
+    safety_settings_NONE=[
+                            { "category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE" },
+                            { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE" },
+                            { "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE" },
+                            { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+                        ]
+
+    assert model == "gemini-pro"
+
+    if chat_state is None:
+        gemini = genai.GenerativeModel(
+            model_name=model, safety_settings=safety_settings_NONE)
+        chat_state = gemini.start_chat()
+
+    parameters = {
+        "temperature": temperature,
+        "top_p": 0.8,
+        "top_k": 40,
+        "max_output_tokens": max_tokens,
+    }
+    output = API_ERROR_OUTPUT
+    for _ in range(API_MAX_RETRY):
+        try:
+            response = chat_state.send_message(conv.messages[-2][1], generation_config=parameters)
+            output = response.text
+            break
+        except Exception as e:
+            print(type(e), e)
+            time.sleep(API_RETRY_SLEEP)
+    return chat_state, output
+
+
+def chat_completion_bedrock(chat_state, model, conv, temperature, max_tokens):
+    from langchain_community.chat_models import BedrockChat
+    from langchain.chains import ConversationChain
+    from langchain.memory import ConversationBufferMemory
+    from langchain.prompts.chat import (
+        ChatPromptTemplate,
+        HumanMessagePromptTemplate,
+        MessagesPlaceholder,
+    )
+
+    if chat_state is None:
+        llm = BedrockChat(
+            model_id=model,
+            model_kwargs={"temperature":temperature},
+        )
+
+        memory = ConversationBufferMemory(return_messages=True)
+        prompt = ChatPromptTemplate.from_messages([
+            MessagesPlaceholder(variable_name="history"),
+            HumanMessagePromptTemplate.from_template("""{input}""")
+        ])
+
+        chat_state = ConversationChain(llm=llm, prompt=prompt, memory=memory)
+
+    output = API_ERROR_OUTPUT
+    for _ in range(API_MAX_RETRY):
+        try:
+            response = chat_state.run(conv.messages[-2][1])
+            output = response
+            break
+        except Exception as e:
+            print(type(e), e)
+            time.sleep(API_RETRY_SLEEP)
+    return chat_state, output
+
+
+def chat_completion_mistral(chat_state, model, conv, temperature, max_tokens):
+    from langchain_mistralai.chat_models import ChatMistralAI
+    from langchain.chains import ConversationChain
+    from langchain.memory import ConversationBufferMemory
+    from langchain.prompts.chat import (
+        ChatPromptTemplate,
+        HumanMessagePromptTemplate,
+        MessagesPlaceholder,
+    )
+
+    if chat_state is None:
+        llm = ChatMistralAI(
+            model=model,
+            mistral_api_key=os.environ.get("MISTRAL_API_KEY"),
+            temperature=temperature, 
+            max_tokens=max_tokens,
+        )
+
+        memory = ConversationBufferMemory(return_messages=True)
+        prompt = ChatPromptTemplate.from_messages([
+            MessagesPlaceholder(variable_name="history"),
+            HumanMessagePromptTemplate.from_template("""{input}""")
+        ])
+
+        chat_state = ConversationChain(llm=llm, prompt=prompt, memory=memory)
+
+    output = API_ERROR_OUTPUT
+    for _ in range(API_MAX_RETRY):
+        try:
+            response = chat_state.run(conv.messages[-2][1])
+            output = response
             break
         except Exception as e:
             print(type(e), e)
@@ -542,33 +758,40 @@ def load_pairwise_model_judgments(filename: str):
     """
     judge_dict = {}
 
-    for line in open(filename):
-        obj = json.loads(line)
-        judge = tuple(obj["judge"])
-        qid, model_1, model_2 = obj["question_id"], obj["model_1"], obj["model_2"]
+    if not os.path.exists(filename):
+        filenames = glob.glob(os.path.join(filename.replace(".jsonl", ""), "*.jsonl"))
+    else:
+        filenames = [filename]
 
-        if judge not in judge_dict:
-            judge_dict[judge] = {}
+    for filename in filenames:
+        for line in open(filename):
+            obj = json.loads(line)
+            obj["question_id"] = int(obj["question_id"])
+            judge = tuple(obj["judge"])
+            qid, model_1, model_2 = obj["question_id"], obj["model_1"], obj["model_2"]
 
-        if "winner" in obj:
-            winner = obj["winner"]
-        elif "g1_winner" in obj and "g2_winner" in obj:
-            g1_winner, g2_winner = obj["g1_winner"], obj["g2_winner"]
-            if g1_winner == g2_winner:
-                winner = g1_winner
+            if judge not in judge_dict:
+                judge_dict[judge] = {}
+
+            if "winner" in obj:
+                winner = obj["winner"]
+            elif "g1_winner" in obj and "g2_winner" in obj:
+                g1_winner, g2_winner = obj["g1_winner"], obj["g2_winner"]
+                if g1_winner == g2_winner:
+                    winner = g1_winner
+                else:
+                    winner = "inconsistent"
             else:
-                winner = "inconsistent"
-        else:
-            raise ValueError(f"Invalid keys: {list(obj.keys())}")
+                raise ValueError(f"Invalid keys: {list(obj.keys())}")
 
-        gamekey = (qid, model_1, model_2)
-        winners = (winner,)
+            gamekey = (qid, model_1, model_2)
+            winners = (winner,)
 
-        judge_dict[judge][gamekey] = {
-            "winners": winners,
-            "g1_judgment": obj["g1_judgment"],
-            "g2_judgment": obj["g2_judgment"],
-        }
+            judge_dict[judge][gamekey] = {
+                "winners": winners,
+                "g1_judgment": obj["g1_judgment"],
+                "g2_judgment": obj["g2_judgment"],
+            }
 
     # Make the model names sorted in the game keys
     normalized = {}
@@ -585,20 +808,27 @@ def load_single_model_judgments(filename: str):
     """
     judge_dict = {}
 
-    for line in open(filename):
-        obj = json.loads(line)
-        judge = tuple(obj["judge"])
-        qid, model = obj["question_id"], obj["model"]
+    if not os.path.exists(filename):
+        filenames = glob.glob(os.path.join(filename.replace(".jsonl", ""), "*.jsonl"))
+    else:
+        filenames = [filename]
 
-        if judge not in judge_dict:
-            judge_dict[judge] = {}
+    for filename in filenames:
+        for line in open(filename):
+            obj = json.loads(line)
+            obj["question_id"] = int(obj["question_id"])
+            judge = tuple(obj["judge"])
+            qid, model = obj["question_id"], obj["model"]
 
-        gamekey = (qid, model)
+            if judge not in judge_dict:
+                judge_dict[judge] = {}
 
-        judge_dict[judge][gamekey] = {
-            "score": obj["score"],
-            "judgment": obj["judgment"],
-        }
+            gamekey = (qid, model)
+
+            judge_dict[judge][gamekey] = {
+                "score": obj["score"],
+                "judgment": obj["judgment"],
+            }
     return judge_dict
 
 
